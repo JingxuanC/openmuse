@@ -25,10 +25,12 @@ function adapter(spec: string) {
   const id = model.trim();
   switch (provider.toLowerCase()) {
     case "openai":
-      return openaiText(id as OpenAIChatModel, {
-        baseURL: process.env.OPENAI_BASE_URL,
-        maxRetries: MODEL_MAX_RETRIES,
-      });
+      return withResponsesAdjacency(
+        openaiText(id as OpenAIChatModel, {
+          baseURL: process.env.OPENAI_BASE_URL,
+          maxRetries: MODEL_MAX_RETRIES,
+        }),
+      );
     case "anthropic":
       // The AI SDK base URL ends in /v1; the Anthropic SDK adds /v1 itself.
       return anthropicText(id as AnthropicChatModel, {
@@ -49,6 +51,38 @@ function adapter(spec: string) {
     default:
       throw unknownProvider(provider, spec);
   }
+}
+
+/**
+ * Responses-style backends (DeepSeek verified by probe) reject a `function_call` item unless
+ * its `function_call_output` follows immediately. The stock converter expands an assistant
+ * message into function_call items and THEN its text, so any reply that mixes text with tool
+ * calls — including ones the model produces mid-loop — 400s on the next request. Split such
+ * messages before conversion so text lands first and call → output stay adjacent.
+ */
+export function withResponsesAdjacency<T>(textAdapter: T): T {
+  const target = textAdapter as {
+    convertMessagesToInput?: (messages: unknown[]) => unknown[];
+  };
+  if (typeof target.convertMessagesToInput !== "function") return textAdapter;
+  const original = target.convertMessagesToInput.bind(textAdapter);
+  target.convertMessagesToInput = (messages: unknown[]) => {
+    const split = (
+      messages as { role?: string; toolCalls?: unknown[]; content?: unknown }[]
+    ).flatMap((message) =>
+      message.role === "assistant" &&
+      message.toolCalls?.length &&
+      ((typeof message.content === "string" && message.content.trim()) ||
+        (Array.isArray(message.content) && message.content.length))
+        ? [
+            { ...message, toolCalls: undefined },
+            { ...message, content: "" },
+          ]
+        : [message],
+    );
+    return original(split);
+  };
+  return textAdapter;
 }
 
 /** With OPENAI_BASE_URL set, a gateway model ID most likely needs the openai/ prefix. */
@@ -97,6 +131,49 @@ const stateTools = [
   }),
 ];
 
+/**
+ * DeepSeek's Responses endpoint rejects the whole request ("No tool output found for tool
+ * call ...") unless every `function_call` item is immediately followed by its
+ * `function_call_output` — a controlled probe showed adjacent = 200, separated = 400. The
+ * TanStack converter expands one assistant message into function_call item(s) and THEN its
+ * text content, so any assistant message with both text and tool calls replays as
+ * call → text → output and 400s; a run killed mid call also leaves resultless calls.
+ *
+ * Normalize replayed history into the shape DeepSeek accepts: assistant text is split into
+ * its own message first, then a calls-only message, then each call's result immediately
+ * after. Resultless (interrupted) calls are dropped, results without a surviving call are
+ * dropped, and duplicate call ids keep only their first occurrence.
+ */
+export function sanitizeOrphanToolCalls(
+  messages: RunAgentInput["messages"],
+): RunAgentInput["messages"] {
+  type Msg = RunAgentInput["messages"][number];
+  const results = new Map<string, Msg>();
+  for (const message of messages)
+    if (message.role === "tool" && message.toolCallId && !results.has(message.toolCallId))
+      results.set(message.toolCallId, message);
+
+  const sanitized: RunAgentInput["messages"] = [];
+  const emittedCalls = new Set<string>();
+  for (const message of messages) {
+    if (message.role === "tool") continue; // re-inserted right after its call, or dropped
+    if (message.role !== "assistant" || !message.toolCalls?.length) {
+      sanitized.push(message);
+      continue;
+    }
+    const content = typeof message.content === "string" ? message.content.trim() : "";
+    if (content) sanitized.push({ ...message, toolCalls: undefined });
+    const calls = message.toolCalls.filter(
+      (call) => !emittedCalls.has(call.id) && results.has(call.id),
+    );
+    for (const call of calls) emittedCalls.add(call.id);
+    if (!calls.length) continue;
+    sanitized.push({ ...message, content: "", toolCalls: calls });
+    for (const call of calls) sanitized.push(results.get(call.id) as Msg);
+  }
+  return sanitized;
+}
+
 /** A BuiltInAgent in TanStack factory mode with the options of the classic AI SDK mode. */
 export function tanstackAgent(options: {
   model: string;
@@ -143,7 +220,9 @@ export function tanstackAgent(options: {
   });
   const run = agent.run.bind(agent);
   agent.run = (input: RunAgentInput) => {
-    const events = splitTextAtToolCalls(run(input));
+    const events = splitTextAtToolCalls(
+      run({ ...input, messages: sanitizeOrphanToolCalls(input.messages) }),
+    );
     return options.stepLimitNote
       ? reportStepLimit(events, options.maxSteps, options.stepLimitNote)
       : events;

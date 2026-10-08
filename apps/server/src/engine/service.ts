@@ -25,6 +25,8 @@ import type {
 } from "../../../../packages/domain/src/index.ts";
 import type { ActionService } from "../actions.ts";
 import type { BrowserService } from "../browser.ts";
+import { DaytonaProvider } from "../cloud/daytona.ts";
+import { CloudComputerService } from "../cloud/service.ts";
 import { ComputerService } from "../computer.ts";
 import type { Config } from "../config.ts";
 import type { Store } from "../db.ts";
@@ -51,8 +53,14 @@ export class AgentService {
     readonly actions: ActionService,
     readonly browser: BrowserService,
     readonly computer: ComputerService = new ComputerService(db, config),
+    readonly cloud: CloudComputerService = new CloudComputerService(
+      db,
+      config,
+      new DaytonaProvider(config),
+    ),
   ) {
     this.worker = new TaskWorker(db, (owner, task, context) => this.execute(owner, task, context), {
+      maxConcurrentPerUser: config.taskMaxConcurrentPerUser,
       settled: (owner, task) => this.publishOutcome(owner, task),
     });
   }
@@ -737,6 +745,9 @@ export class AgentService {
       task.prompt,
     );
     if (task.actionId) {
+      // Background path: the task worker drives this, not a request, so it runs without a request
+      // identity and must keep working for every owner. The review it consults is still the one
+      // addressed by this task's own owner, so the cross-owner pass never crosses a tenant boundary.
       const action = await this.db.get<ActionProposal>(owner, "actions", task.actionId);
       if (!action) throw new Error("The linked review could not be found");
       if (action.status === "succeeded") {

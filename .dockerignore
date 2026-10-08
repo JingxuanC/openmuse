@@ -1,0 +1,14 @@
+node_modules
+dist
+.openmuse
+apps/mobile
+apps/worker/tests
+apps/computer
+docs
+tests
+infra
+*.md
+.env
+.env.*
+!.env.example
+.git

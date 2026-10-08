@@ -1,17 +1,33 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { Config } from "./config.ts";
+import { type Config, defaultSupabaseUrl } from "./config.ts";
 import type { Store } from "./db.ts";
 import { AppError } from "./errors.ts";
+import { createSupabaseJwt, type SupabaseJwt, type SupabaseUser } from "./supabase-jwt.ts";
 
 const digest = (value: string) => createHash("sha256").update(value).digest();
+
 export class Auth {
   constructor(
     private readonly db: Store,
     private readonly config: Config,
     private readonly signingKey: string,
+    private readonly jwt?: SupabaseJwt,
   ) {}
+  private verifier() {
+    // createAuth always passes one in supabase mode; this only catches a hand-built Auth.
+    if (!this.jwt) throw new AppError("Supabase authentication is not configured", 503);
+    return this.jwt;
+  }
+  /** Supabase mints and refreshes the token on the client; the server only verifies it. */
+  async supabaseSession(
+    accessToken?: string,
+  ): Promise<{ mode: Config["mode"]; user: SupabaseUser }> {
+    const token = accessToken?.trim();
+    return { mode: this.config.mode, user: await this.verifier().user(token && `Bearer ${token}`) };
+  }
+  /** Local dev sign-in: the access key buys a session token, and every session belongs to one user. */
   async session(accessKey?: string) {
     if (
       this.config.mode === "live" &&
@@ -29,6 +45,7 @@ export class Auth {
     return { token, mode: this.config.mode };
   }
   async owner(authorization?: string) {
+    if (this.config.authMode === "supabase") return (await this.verifier().user(authorization)).id;
     if (!authorization?.startsWith("Bearer ")) throw new AppError("Sign in to OpenMuse", 401);
     const session = await this.db.get<{ owner: string; expiresAt: number }>(
       "system",
@@ -76,5 +93,10 @@ export async function createAuth(db: Store, config: Config) {
     key = randomBytes(32).toString("base64");
     await writeFile(path, key, { mode: 0o600, flag: "wx" });
   }
-  return new Auth(db, config, key);
+  // Reachability is checked here so an unreachable JWKS stops the boot rather than every request.
+  const jwt =
+    config.authMode === "supabase"
+      ? await createSupabaseJwt(config.supabaseUrl ?? defaultSupabaseUrl)
+      : undefined;
+  return new Auth(db, config, key, jwt);
 }

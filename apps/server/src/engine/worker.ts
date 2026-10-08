@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { AgentTask, RunEvent } from "../../../../packages/domain/src/agent.ts";
 import type { Store } from "../db.ts";
 import { backgroundFailure } from "../log.ts";
+import { defaultMaxConcurrentPerUser, type OwnedTask, selectEligible } from "./scheduling.ts";
 
 export class LostLeaseError extends Error {
   constructor() {
@@ -33,6 +34,8 @@ export class TaskWorker {
       now?: () => number;
       leaseMs?: number;
       pollMs?: number;
+      /** Tasks one owner may run at once; see TASK_MAX_CONCURRENT_PER_USER. */
+      maxConcurrentPerUser?: number;
       settled?: (owner: string, task: AgentTask) => Promise<void>;
     } = {},
   ) {}
@@ -63,6 +66,15 @@ export class TaskWorker {
   }
   async tick() {
     if (this.stopping) return;
+    // Deliberately global, never a tenant: a tick claims tasks for every owner, so it runs outside
+    // any request's user transaction. Under RLS its Postgres role is expected to hold BYPASSRLS
+    // (infra/migrations/0001_records_rls.sql) — running it as one user would hide every other owner.
+    // The approval sweep below is cross-owner for that same reason and is meant to be: it settles
+    // expired reviews for every tenant in one pass, and every action it reads or writes is still
+    // addressed by that task's own owner, never by the sweep's.
+    await this.db.withoutUser(() => this.tickAll());
+  }
+  private async tickAll() {
     if (this.running)
       await this.db.put("system", "worker-status", {
         id: "tasks",
@@ -81,7 +93,16 @@ export class TaskWorker {
             (t.status === "running" && Date.parse(t.leaseUntil ?? "") <= this.now()) ||
             t.status === "waiting_approval"),
       );
-      const eligible = [];
+      // A task holding a live lease is already running somewhere — this worker, or another one
+      // sharing the database — so it occupies one of its owner's slots. An expired lease does not:
+      // that task sits in `due` and is about to be reclaimed below.
+      const runningByOwner = new Map<string, number>();
+      for (const { owner, value } of records) {
+        if (value.status !== "running") continue;
+        if (Date.parse(value.leaseUntil ?? "") > this.now())
+          runningByOwner.set(owner, (runningByOwner.get(owner) ?? 0) + 1);
+      }
+      const candidates: OwnedTask<AgentTask>[] = [];
       for (const record of due) {
         if (record.value.status === "waiting_approval") {
           const action = record.value.actionId
@@ -105,9 +126,13 @@ export class TaskWorker {
             );
           else if (action && ["awaiting_review", "executing"].includes(action.status)) continue;
         }
-        eligible.push(record);
-        if (eligible.length === 3) break;
+        candidates.push(record);
       }
+      const eligible = selectEligible(
+        candidates,
+        runningByOwner,
+        this.options.maxConcurrentPerUser ?? defaultMaxConcurrentPerUser,
+      );
       await Promise.all(eligible.map(({ owner, value }) => this.run(owner, value)));
     } finally {
       this.ticking = false;

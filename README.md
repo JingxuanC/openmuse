@@ -70,9 +70,6 @@ git clone https://github.com/CopilotKit/OpenMuse.git openmuse
 cd openmuse
 pnpm install --frozen-lockfile
 cp .env.example .env
-npx copilotkit@latest login
-npx copilotkit@latest project select
-# Set CPK_INTELLIGENCE_API_KEY in .env to the generated server-only project key.
 pnpm dev
 ```
 
@@ -92,6 +89,10 @@ Open [localhost:8081](http://localhost:8081). The API runs at [localhost:8787/ap
 4. Start the [browser worker](#browser-worker) and configure a model, then ask **“Check out Hacker News for cool stuff”** or **“Summarize copilotkit.ai”**. Follow the browser inline and use **Take control** to open its session. For a model-free version of this flow, follow the [AI Mock demo setup](docs/DEMO.md#run-the-agent-browser-demo).
 
 For iOS or Android, use `pnpm --dir apps/mobile ios` or `pnpm --dir apps/mobile android`. Xcode or Android tooling is required. The PDF reader needs an Expo development build; use [native setup](apps/mobile/README.md).
+
+The mobile app signs in with Supabase email and password, or with a one-time email code, against the same project the API verifies. Copy `apps/mobile/.env.example` to `apps/mobile/.env` and set `EXPO_PUBLIC_SUPABASE_ANON_KEY`; Expo reads `apps/mobile/.env`, not the repository root `.env`. The anon key is public by design — never ship the `service_role` key in it. Set `EXPO_PUBLIC_AUTH_MODE=local` to keep the single-owner access-key sign-in for a development server without Supabase.
+
+The email code comes from the Supabase **Magic Link** mail template, which must contain the `{{ .Token }}` placeholder. A template with only a link sends a URL the app cannot verify.
 
 ## Deploy on Render
 

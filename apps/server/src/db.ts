@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import { PGlite } from "@electric-sql/pglite";
@@ -5,13 +6,53 @@ import pg from "pg";
 import { backgroundFailure } from "./log.ts";
 
 type Row = { data: Record<string, unknown> };
-interface Database {
+/** What a pooled pg client and the embedded PGlite instance have in common, so a query can be routed to either. */
+interface Queryable {
   query: (sql: string, params?: unknown[]) => Promise<{ rows: Row[] }>;
+}
+interface Database extends Queryable {
+  withUser: <T>(userId: string, fn: () => Promise<T>) => Promise<T>;
+  withoutUser: <T>(fn: () => Promise<T>) => Promise<T>;
   close: () => Promise<void>;
+}
+
+interface UserSession extends Queryable {
+  userId: string;
+}
+
+/**
+ * The connection a request's queries must run on. A pool hands a different connection to each query,
+ * so `SET LOCAL app.user_id` only constrains the queries issued on the connection that ran it: the
+ * identity has to travel with the async call, not with the pool.
+ */
+const session = new AsyncLocalStorage<UserSession>();
+
+/**
+ * One identity per request. Re-entering for the same user reuses the session; switching users
+ * mid-request is a bug, and on Postgres it would also hold a second connection for no reason.
+ * Embedded PGlite is a single connection, where a second transaction would deadlock outright.
+ */
+function reenter<T>(open: UserSession, userId: string, fn: () => Promise<T>): Promise<T> {
+  if (open.userId === userId) return fn();
+  throw new Error(`Cannot run as ${userId} inside ${open.userId}'s session`);
 }
 
 export class Store {
   constructor(private readonly db: Database) {}
+  /**
+   * Runs `fn` with every Store query in the caller's identity. On Postgres that is one checked-out
+   * connection inside a transaction carrying `app.user_id` — what an RLS policy reads
+   * (`infra/migrations/0001_records_rls.sql`) — and `SET LOCAL` expires with it, so the pooled
+   * connection keeps no user id. Embedded PGlite has a single connection and no RLS, so it carries
+   * the identity without a transaction; see pgliteDatabase.
+   */
+  withUser<T>(userId: string, fn: () => Promise<T>): Promise<T> {
+    return this.db.withUser(userId, fn);
+  }
+  /** The escape hatch for cross-owner work: see TaskWorker.tick. */
+  withoutUser<T>(fn: () => Promise<T>): Promise<T> {
+    return this.db.withoutUser(fn);
+  }
   async get<T = Record<string, unknown>>(
     owner: string,
     kind: string,
@@ -88,6 +129,11 @@ export class Store {
     );
     return (result.rows[0]?.data as T | undefined) ?? null;
   }
+  /**
+   * Deliberately cross-owner: this runs at boot (apps/server/src/index.ts) before any request has an
+   * identity, and a crash mid-execution is nobody's request. Each repaired row keeps the owner it
+   * was written under, so the sweep restores ownership rather than reassigning it.
+   */
   async recoverInterruptedActions(): Promise<void> {
     await this.db.query(
       `UPDATE records SET data=data || '{"status":"outcome_unknown","error":"Server restarted during execution. Check the provider before creating another action."}'::jsonb WHERE kind='actions' AND data->>'status'='executing'`,
@@ -119,22 +165,71 @@ export function createPool(connectionString: string) {
   return pool;
 }
 
+/** Split out so tests can point the Postgres path at a recorded stand-in connection. */
+export function poolDatabase(pool: pg.Pool): Database {
+  return {
+    query: (sql, params) => (session.getStore() ?? pool).query(sql, params),
+    async withUser(userId, fn) {
+      const open = session.getStore();
+      if (open) return reenter(open, userId, fn);
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        // `set_config(..., true)` is SET LOCAL: the setting dies with the transaction instead of
+        // outliving the request on a connection the pool will hand to somebody else.
+        await client.query("SELECT set_config('app.user_id',$1,true)", [userId]);
+        const result = await session.run(
+          { userId, query: (sql, params) => client.query(sql, params) },
+          fn,
+        );
+        await client.query("COMMIT");
+        return result;
+      } catch (error) {
+        // A commit that never landed leaves the transaction open; clear it before releasing.
+        await client.query("ROLLBACK").catch(() => {});
+        throw error;
+      } finally {
+        client.release();
+      }
+    },
+    withoutUser: (fn) => session.exit(fn),
+    close: () => pool.end(),
+  };
+}
+
+function pgliteDatabase(embedded: PGlite): Database {
+  return {
+    query: (sql, params) => (session.getStore() ?? embedded).query<Row>(sql, params),
+    async withUser(userId, fn) {
+      const open = session.getStore();
+      if (open) return reenter(open, userId, fn);
+      // Embedded PGlite has one connection, shared with the task worker that runs in-process by
+      // default, and no RLS to satisfy: a request holding a transaction for its whole duration would
+      // stall that worker and deadlock outright where a handler awaits a tick. The identity still
+      // travels with the call, so callers see one contract on both backends.
+      return session.run({ userId, query: (sql, params) => embedded.query<Row>(sql, params) }, fn);
+    },
+    withoutUser: (fn) => session.exit(fn),
+    close: () => embedded.close(),
+  };
+}
+
+/** The connection wiring createStore is built on, exposed so tests can run raw SQL in the same session. */
+export async function createDatabase(
+  options: { dataDir?: string; databaseUrl?: string } = {},
+): Promise<Database> {
+  if (options.databaseUrl) return poolDatabase(createPool(options.databaseUrl));
+  if (options.dataDir) await mkdir(dirname(options.dataDir), { recursive: true, mode: 0o700 });
+  const embedded = new PGlite(options.dataDir);
+  await embedded.waitReady;
+  return pgliteDatabase(embedded);
+}
+
 export async function createStore(
   options: { dataDir?: string; databaseUrl?: string } = {},
 ): Promise<Store> {
-  let database: Database;
-  if (options.databaseUrl) {
-    const pool = createPool(options.databaseUrl);
-    database = { query: async (sql, params) => pool.query(sql, params), close: () => pool.end() };
-  } else {
-    if (options.dataDir) await mkdir(dirname(options.dataDir), { recursive: true, mode: 0o700 });
-    const embedded = new PGlite(options.dataDir);
-    await embedded.waitReady;
-    database = {
-      query: (sql, params) => embedded.query<Row>(sql, params),
-      close: () => embedded.close(),
-    };
-  }
+  const database = await createDatabase(options);
+  // Schema setup runs as the owner, outside any user transaction.
   await database.query(
     "CREATE TABLE IF NOT EXISTS records(owner text NOT NULL,kind text NOT NULL,id text NOT NULL,data jsonb NOT NULL,updated_at timestamptz NOT NULL DEFAULT now(),PRIMARY KEY(owner,kind,id))",
   );

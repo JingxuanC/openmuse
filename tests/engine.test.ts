@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { createStore } from "../apps/server/src/db.ts";
 import { analyzeSpending } from "../apps/server/src/engine/finance.ts";
+import { selectEligible } from "../apps/server/src/engine/scheduling.ts";
 import { TaskWorker } from "../apps/server/src/engine/worker.ts";
 import type { AgentTask } from "../packages/domain/src/agent.ts";
 
@@ -190,6 +191,79 @@ test("run history keeps the time the run started", async () => {
     await db.close();
   }
 });
+test("scheduling favors the least loaded owner and skips a capped one without stalling others", () => {
+  const owned = (owner: string, id: string, createdAt: string) => ({
+    owner,
+    value: { id, createdAt },
+  });
+  // Owner "a" is four tasks deep on a limit of one; the other owners still get their turn.
+  const backlog = [
+    owned("a", "a1", "2020-01-01T00:00:00.000Z"),
+    owned("a", "a2", "2020-01-02T00:00:00.000Z"),
+    owned("a", "a3", "2020-01-03T00:00:00.000Z"),
+    owned("a", "a4", "2020-01-04T00:00:00.000Z"),
+    owned("b", "b1", "2026-01-01T00:00:00.000Z"),
+    owned("c", "c1", "2026-01-02T00:00:00.000Z"),
+  ];
+  assert.deepEqual(
+    selectEligible(backlog, new Map(), 1).map(({ value }) => value.id),
+    ["a1", "b1", "c1"],
+  );
+  // A deep backlog cannot take the whole tick while another owner waits behind it.
+  const backlogged = [
+    owned("a", "a1", "2020-01-01T00:00:00.000Z"),
+    owned("a", "a2", "2020-01-02T00:00:00.000Z"),
+    owned("a", "a3", "2020-01-03T00:00:00.000Z"),
+    owned("b", "b1", "2026-01-01T00:00:00.000Z"),
+  ];
+  assert.deepEqual(
+    selectEligible(backlogged, new Map(), 3).map(({ value }) => value.id),
+    ["a1", "b1", "a2"],
+  );
+  // A busy owner yields to an idle one even when its backlog arrived first.
+  const twoOwners = [
+    owned("busy", "busy-queued", "2020-01-01T00:00:00.000Z"),
+    owned("idle", "idle-queued", "2026-01-01T00:00:00.000Z"),
+  ];
+  assert.deepEqual(
+    selectEligible(twoOwners, new Map([["busy", 1]]), 2).map(({ value }) => value.id),
+    ["idle-queued", "busy-queued"],
+  );
+  assert.deepEqual(
+    selectEligible(twoOwners, new Map([["busy", 2]]), 2).map(({ value }) => value.id),
+    ["idle-queued"],
+  );
+  // One tick claims a bounded batch.
+  assert.equal(selectEligible(backlog, new Map(), 4, 2).length, 2);
+});
+
+test("a per-user limit caps how many tasks one owner runs at once", async () => {
+  const db = await createStore();
+  try {
+    for (const id of ["a", "b", "c", "d"]) await db.put("owner", "tasks", task(id));
+    let running = 0;
+    let peak = 0;
+    const worker = new TaskWorker(
+      db,
+      async () => {
+        peak = Math.max(peak, ++running);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        running--;
+        return { status: "succeeded" };
+      },
+      { maxConcurrentPerUser: 2 },
+    );
+    await worker.tick();
+    assert.equal(peak, 2);
+    const queued = (await db.scan<AgentTask>("tasks")).filter(
+      ({ value }) => value.status === "queued",
+    );
+    assert.equal(queued.length, 2);
+  } finally {
+    await db.close();
+  }
+});
+
 test("a failed run record does not leave the task stuck in the worker", async () => {
   const db = await createStore();
   try {
