@@ -1,11 +1,11 @@
 import "./config.ts";
-import { HttpAgent } from "@ag-ui/client";
 import {
   type AgentsFactory,
   type CopilotKitIntelligence,
   CopilotRuntime,
   createCopilotHonoHandler,
 } from "@copilotkit/runtime/v2";
+import { createLangAlphaAgent } from "./agui.ts";
 import type { Auth } from "./auth.ts";
 import type { Config } from "./config.ts";
 import { ConversationAgent } from "./engine/conversation.ts";
@@ -44,15 +44,17 @@ export function makeRuntime(
             sharedJevAdapter(),
           )
         : config.agentBackend === "agui"
-          ? new HttpAgent({
+          ? createLangAlphaAgent({
               url: config.agentUrl ?? "http://127.0.0.1:1/unconfigured",
-              headers: config.agentToken ? { Authorization: `Bearer ${config.agentToken}` } : {},
+              token: config.agentToken,
             })
           : new ConversationAgent(
               config,
               service,
               await auth.owner(request.headers.get("authorization") ?? undefined),
               sharedJevAdapter(),
+              // Inert outside hybrid: only a delegated vertical agent spends it.
+              request.headers.get("authorization") ?? undefined,
             ),
   });
   const runtime = new CopilotRuntime({

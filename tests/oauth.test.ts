@@ -19,6 +19,7 @@ function deferred<T>() {
 function oauthConfig(): Config {
   return {
     mode: "live",
+    authMode: "local",
     port: 8787,
     host: "127.0.0.1",
     publicUrl: "http://localhost:8787",
@@ -38,6 +39,7 @@ test("old refresh cannot overwrite a newly connected Google account", async (t) 
   const key = randomBytes(32).toString("base64");
   const config: Config = {
     mode: "live",
+    authMode: "local",
     port: 8787,
     host: "127.0.0.1",
     publicUrl: "http://localhost:8787",
@@ -97,6 +99,7 @@ test("OAuth callbacks require a known, single-use state", async (t) => {
   t.after(() => db.close());
   const config: Config = {
     mode: "live",
+    authMode: "local",
     port: 8787,
     host: "127.0.0.1",
     publicUrl: "http://localhost:8787",

@@ -37,6 +37,7 @@ before(async () => {
   db = await createStore({ dataDir: join(directory, "db") });
   config = {
     mode: "sample",
+    authMode: "local",
     port: 8787,
     host: "127.0.0.1",
     publicUrl: "http://localhost:8787",

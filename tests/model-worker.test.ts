@@ -40,6 +40,7 @@ test("CopilotKit model worker executes server tools and persists the confirmed o
     db,
     {
       mode: "sample",
+      authMode: "local",
       port: 8787,
       host: "127.0.0.1",
       publicUrl: "http://localhost:8787",
@@ -136,6 +137,7 @@ test("the model worker keeps the text a model replies with when it calls no tool
   });
   const server = await createApp(db, {
     mode: "sample",
+    authMode: "local",
     port: 8787,
     host: "127.0.0.1",
     publicUrl: "http://localhost:8787",
@@ -180,6 +182,7 @@ test("replaying a completed prepared action returns its receipt without reopenin
   const { requests } = await modelFixture(t, (index) => calls[index]);
   const server = await createApp(db, {
     mode: "sample",
+    authMode: "local",
     port: 8787,
     host: "127.0.0.1",
     publicUrl: "http://localhost:8787",

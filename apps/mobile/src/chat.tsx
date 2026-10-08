@@ -28,12 +28,20 @@ import { BrowserRunContext, BrowserToolCard } from "./browser-tool-card";
 import { BrowserThreadCard } from "./computer";
 import { ConversationQueue, type QueuedMessage } from "./conversation-queue";
 import { runConversationTurn } from "./conversation-run";
+import {
+  addDelegateProgress,
+  type DelegateProgress,
+  delegateProgressEvent,
+  parseDelegateProgress,
+} from "./delegate-progress";
 import { confirmedJevSelection, displayJevUserMessage, latestJevPanelId } from "./jev-actions";
 import { JevInteractionContext, JevToolCard } from "./jev-tool-card";
 import { MailToolCard } from "./mail-tool-card";
 import { FileThreadCard, TaskThreadCard } from "./thread-artifacts";
 import { type Selection, useMuseThread } from "./threads";
 import { Button, Card, CheckRow, colors, ErrorNotice, s } from "./ui";
+import { VerticalArtifactCard } from "./vertical-artifact-card";
+import { parseVerticalResult } from "./vertical-result";
 import { useWorkspace } from "./workspace";
 
 const displayParameters = z.record(z.string(), z.unknown());
@@ -205,6 +213,8 @@ export function ChatScreen({
   const [loaded, setLoaded] = useState(false);
   const [picking, setPicking] = useState(false);
   const [attachments, setAttachments] = useState<string[]>([]);
+  const [delegateProgress, setDelegateProgress] = useState<DelegateProgress[]>([]);
+  const progressId = useRef(0);
   const list = useRef<ScrollView>(null);
   const [queue] = useState(() => new ConversationQueue());
   const choiceCompletions = useRef(
@@ -257,6 +267,26 @@ export function ChatScreen({
       if (richThreads) void agent.detachActiveRun().catch(() => {});
     };
   }, [agent, agentId, api, copilotkit, isReady, historyAttempt, richThreads, selection.existing]);
+  /**
+   * A delegated run is minutes with nothing in the transcript to show for it.
+   * The server forwards the delegate's steps as CUSTOM frames beside the run;
+   * they never become messages, so they are read here and nowhere else. A run
+   * starts from a clean slate, or the last one's lines would sit under it.
+   */
+  useEffect(() => {
+    const subscription = agent.subscribe({
+      onRunInitialized: () => setDelegateProgress([]),
+      onEvent: ({ event }) => {
+        if (event.type !== "CUSTOM" || event.name !== delegateProgressEvent) return;
+        const line = parseDelegateProgress(event.value);
+        if (line)
+          setDelegateProgress((lines) =>
+            addDelegateProgress(lines, { ...line, id: ++progressId.current }),
+          );
+      },
+    });
+    return () => subscription.unsubscribe();
+  }, [agent]);
   const saveHistory = useCallback(async () => {
     if (!richThreads) await api.request("/api/conversation", { messages: agent.messages }, "PUT");
     setSaveError("");
@@ -548,8 +578,22 @@ export function ChatScreen({
                         (candidate): candidate is ToolMessage =>
                           candidate.role === "tool" && candidate.toolCallId === toolCall.id,
                       );
+                      // A delegated run answers with artifacts and sources
+                      // rather than a plain report. Which vertical agents exist
+                      // is server configuration, so the result's shape decides:
+                      // anything else renders through CopilotKit as before.
+                      const delegated = parseVerticalResult(toolMessage?.content);
                       return (
-                        <View key={toolCall.id}>{renderToolCall({ toolCall, toolMessage })}</View>
+                        <View key={toolCall.id}>
+                          {delegated ? (
+                            <VerticalArtifactCard
+                              name={toolCall.function.name}
+                              result={delegated}
+                            />
+                          ) : (
+                            renderToolCall({ toolCall, toolMessage })
+                          )}
+                        </View>
                       );
                     })}
                   </BrowserRunContext>
@@ -603,6 +647,18 @@ export function ChatScreen({
           </>
         )}
         {(!richThreads || selection.id === mainId) && <BackgroundUpdates />}
+        {(busy || agent.isRunning) && !!delegateProgress.length && (
+          <View
+            accessibilityLabel="What the delegated agent is doing"
+            style={{ alignSelf: "flex-start", gap: 3, paddingHorizontal: 4 }}
+          >
+            {delegateProgress.map((line) => (
+              <Text key={line.id} numberOfLines={1} style={s.muted}>
+                {line.agent} · {line.text}
+              </Text>
+            ))}
+          </View>
+        )}
         {(busy || agent.isRunning) && (
           <View
             accessibilityLabel="Agent is working"

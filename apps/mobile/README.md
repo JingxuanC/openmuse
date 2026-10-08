@@ -20,7 +20,11 @@ pnpm --dir apps/mobile ios
 pnpm --dir apps/mobile android
 ```
 
-The default API is `http://localhost:8787`, or `http://10.0.2.2:8787` on the Android emulator. Set `EXPO_PUBLIC_API_URL` to your reachable server URL for a physical device or deployment. Live mode asks for the server access key; local mode opens the fictional workspace automatically. Tokens stay in memory.
+The default API is `http://localhost:8787`, or `http://10.0.2.2:8787` on the Android emulator. Set `EXPO_PUBLIC_API_URL` to your reachable server URL for a physical device or deployment.
+
+Copy `.env.example` to `.env` and set `EXPO_PUBLIC_SUPABASE_ANON_KEY` from the Supabase project the server verifies. Sign in with an email and password, create the account from the same screen, or ask for a one-time email code. The one-time code needs that project's **Magic Link** mail template to contain `{{ .Token }}`; a template with only a link sends a URL the app cannot verify.
+
+Sessions live in `expo-secure-store`. A Supabase session JSON exceeds SecureStore's 2048-byte value limit, so it is split across numbered keys and reassembled on read. The app restores the session at launch, renews the access token when it returns to the foreground, and retries a request once on 401 before falling back to the sign-in screen. `EXPO_PUBLIC_AUTH_MODE=local` keeps the single-owner access key for a development server without Supabase.
 
 PDFs use `react-native-pdf` and `react-native-blob-util` in an Expo **development build**. Expo Go does not include these native modules. The config plugins in `app.json` configure the native projects. Web uses the browser’s real PDF reader, with page/zoom controls and download/print access. PDF form fields save a new server artifact.
 

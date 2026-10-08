@@ -108,6 +108,8 @@ export async function createWorkerServer(options: {
               "The browser operation failed. Check worker health and reopen the session.",
               500,
             );
+      // The generic 500 tells the caller nothing; the real cause lives only here.
+      if (!(error instanceof WorkerError)) console.error("[worker] unhandled failure:", error);
       if (!response.headersSent && !response.destroyed)
         json(safe.status, { error: { code: safe.code, message: safe.message } });
       else response.end();

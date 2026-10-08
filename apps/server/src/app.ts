@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import { MessageSchema } from "@ag-ui/core";
-import { CopilotKitIntelligence } from "@copilotkit/runtime/v2";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { cors } from "hono/cors";
@@ -10,21 +9,27 @@ import { ActionService } from "./actions.ts";
 import { agentConfigured, makeRuntime } from "./agent.ts";
 import { createAuth } from "./auth.ts";
 import { BrowserService } from "./browser.ts";
+import { DaytonaProvider } from "./cloud/daytona.ts";
+import type { CloudProvider } from "./cloud/provider.ts";
+import { CloudComputerService } from "./cloud/service.ts";
 import { ComputerService, type DockerRunner } from "./computer.ts";
 import { computerRoutes } from "./computer-routes.ts";
-import { assertApiDeploymentConfig, type Config } from "./config.ts";
+import { assertApiDeploymentConfig, type Config, defaultSupabaseUrl } from "./config.ts";
 import type { Store } from "./db.ts";
 import { agentRoutes } from "./engine/routes.ts";
 import { AgentService } from "./engine/service.ts";
+import { verticalFileRoutes } from "./engine/vertical-files.ts";
 import { AppError } from "./errors.ts";
 import { Files } from "./files.ts";
 import { GoogleAuth } from "./google-auth.ts";
+import { createIntelligence } from "./intelligence/create-intelligence.ts";
+import { supabaseProxy } from "./supabase-proxy.ts";
 import { WorkspaceService } from "./workspace.ts";
 
 export async function createApp(
   db: Store,
   config: Config,
-  options: { docker?: DockerRunner } = {},
+  options: { docker?: DockerRunner; cloud?: CloudProvider } = {},
 ) {
   assertApiDeploymentConfig(config);
   const auth = await createAuth(db, config),
@@ -40,8 +45,9 @@ export async function createApp(
   });
   const browser = new BrowserService(db, config, auth, files);
   const computer = new ComputerService(db, config, options.docker);
-  const agent = new AgentService(db, config, workspace, files, actions, browser, computer);
-  const intelligence = new CopilotKitIntelligence({ apiKey: config.intelligenceApiKey });
+  const cloud = new CloudComputerService(db, config, options.cloud ?? new DaytonaProvider(config));
+  const agent = new AgentService(db, config, workspace, files, actions, browser, computer, cloud);
+  const intelligence = createIntelligence(db, config);
   const runtime = makeRuntime(config, agent, auth, intelligence);
   const app = new Hono<{ Variables: { owner: string } }>();
   const origins = new Set([...config.allowedOrigins, new URL(config.publicUrl).origin]);
@@ -57,7 +63,14 @@ export async function createApp(
     "*",
     cors({
       origin: (origin) => (origins.has(origin) ? origin : undefined),
-      allowHeaders: ["Content-Type", "Authorization"],
+      allowHeaders: [
+        "Content-Type",
+        "Authorization",
+        // Sent by supabase-js; without them the browser's preflight blocks sign-in.
+        "apikey",
+        "X-Client-Info",
+        "X-Supabase-Api-Version",
+      ],
       allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
       credentials: true,
     }),
@@ -105,11 +118,18 @@ export async function createApp(
     }
     if (++loginAttempts > 30)
       throw new AppError("Too many sign-in attempts. Try again in a minute.", 429);
-    const body = z.object({ accessKey: z.string().optional() }).parse(await c.req.json());
-    const session = await auth.session(body.accessKey);
-    await workspace.ensureSample("local-user", actions);
-    await agent.ensure("local-user");
-    if (config.mode === "sample") await agent.refreshIdeas("local-user");
+    const body = z
+      .object({ accessKey: z.string().optional(), accessToken: z.string().optional() })
+      .parse(await c.req.json());
+    const session =
+      config.authMode === "supabase"
+        ? await auth.supabaseSession(body.accessToken)
+        : await auth.session(body.accessKey);
+    // Supabase mode derives the tenant from the token; local mode has exactly one.
+    const owner = "user" in session ? session.user.id : "local-user";
+    await workspace.ensureSample(owner, actions);
+    await agent.ensure(owner);
+    if (config.mode === "sample") await agent.refreshIdeas(owner);
     return c.json(session);
   });
   app.get("/api/google/callback", async (c) => {
@@ -123,6 +143,12 @@ export async function createApp(
       "<h1>Google is connected</h1><p>Return to OpenMuse and refresh your workspace.</p>",
     );
   });
+  // Supabase Auth for clients that cannot reach supabase.co. Sign-in has to work before there
+  // is a token, so this route sits above the /api/* gate; the proxy itself only forwards
+  // /auth/v1/ and never touches the database.
+  app.on(["GET", "POST"], "/api/supa/*", (c) =>
+    supabaseProxy(c, config.supabaseUrl ?? defaultSupabaseUrl),
+  );
   app.use("/api/*", async (c, next) => {
     const signedRoute =
       /^\/api\/files\/[^/]+\/content$|^\/api\/browsers\/[^/]+\/(?:preview|console)$/.test(
@@ -133,7 +159,10 @@ export async function createApp(
         ? auth.verify(new URL(c.req.url))
         : await auth.owner(c.req.header("authorization"));
     c.set("owner", owner);
-    await next();
+    // Identity is resolved above, outside the session, so the lookup that finds a session is never
+    // filtered by the tenant it is looking for. Downstream queries then run in the caller's context
+    // on the backend that can carry one — Postgres, where RLS reads `app.user_id`.
+    await db.withUser(owner, () => next());
   });
   app.get("/api/workspace", async (c) => {
     const [snapshot, reachable] = await Promise.all([
@@ -151,6 +180,7 @@ export async function createApp(
   });
   app.route("/api/agent", agentRoutes(agent));
   app.route("/api/computer", computerRoutes(computer, files));
+  app.route("/api/vertical", verticalFileRoutes(config, auth));
   app.get("/api/calendars", async (c) => c.json(await workspace.calendars(c.get("owner"))));
   app.get("/api/calendar/events", async (c) => {
     const query = z
@@ -347,5 +377,5 @@ export async function createApp(
   app.get("/", (c) =>
     c.json({ name: "OpenMuse", app: "http://localhost:8081", health: "/api/health" }),
   );
-  return { app, auth, files, actions, workspace, agent, computer };
+  return { app, auth, files, actions, workspace, agent, computer, intelligence };
 }

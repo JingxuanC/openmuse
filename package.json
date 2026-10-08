@@ -40,10 +40,12 @@
     "@tanstack/ai-openai": "^0.23.2",
     "@typesafe-ai/sdk": "0.6.0",
     "hono": "^4.11.4",
+    "jose": "^6.2.12",
     "parse5": "^7.3.0",
     "pdf-lib": "^1.17.1",
     "pg": "^8.16.3",
     "rxjs": "7.8.1",
+    "ws": "^8.18.0",
     "zod": "^4.1.0"
   },
   "devDependencies": {
@@ -52,6 +54,7 @@
     "@copilotkit/core": "1.70.1",
     "@types/node": "^24.0.0",
     "@types/pg": "^8.15.5",
+    "@types/ws": "^8.18.0",
     "tsx": "^4.20.0",
     "typescript": "~5.9.2"
   }

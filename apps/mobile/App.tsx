@@ -32,14 +32,16 @@ import {
   IdeasScreen,
 } from "./src/agent-ui";
 import { AgentWorkspaceProvider, useAgentWorkspace } from "./src/agent-workspace";
-import { API_URL, createSession, MuseApi } from "./src/api";
+import { API_URL, MuseApi } from "./src/api";
+import { SignInScreen, SignInSplash } from "./src/auth-screen";
 import { ChatScreen, WorkspaceTools } from "./src/chat";
 import { ComputerEntry } from "./src/computer";
 import { ComputerDraftProvider } from "./src/computer-drafts";
 import { Details } from "./src/details";
 import { BrowserScreen, CalendarScreen, FilesScreen, MailScreen } from "./src/screens";
+import { type Auth, useAuth } from "./src/session";
 import { ThreadsProvider, ThreadsSheet, useMuseThread } from "./src/threads";
-import { Button, Card, colors, ErrorNotice, Field, IconButton, Mascot, s } from "./src/ui";
+import { Button, colors, ErrorNotice, IconButton, Mascot, s } from "./src/ui";
 import { type Detail, useWorkspace, WorkspaceContext } from "./src/workspace";
 
 const nav: { id: Section; label: string; icon: LucideIcon }[] = [
@@ -67,82 +69,35 @@ const titles: Partial<Record<Section, { title: string; subtitle: string }>> = {
   files: { title: "Files", subtitle: "Documents, forms and filled copies." },
 };
 export default function App() {
-  const [token, setToken] = useState("");
-  const [accessKey, setAccessKey] = useState("");
-  const [busy, setBusy] = useState(true);
-  const [error, setError] = useState("");
-  const connect = useCallback(async (key?: string) => {
-    setBusy(true);
-    setError("");
-    try {
-      const session = await createSession(key);
-      setToken(session.token);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  }, []);
-  useEffect(() => {
-    void connect();
-  }, [connect]);
+  const auth = useAuth();
   return (
     <SafeAreaProvider>
       <StatusBar style="dark" />
-      {token ? (
+      {auth.status === "loading" ? (
+        <SignInSplash label="Checking your session…" />
+      ) : auth.status === "ready" ? (
         <CopilotKitProvider
           runtimeUrl={`${API_URL}/api/copilotkit`}
-          headers={{ Authorization: `Bearer ${token}` }}
+          headers={{ Authorization: `Bearer ${auth.token}` }}
         >
-          <WorkspaceApp token={token} />
+          <WorkspaceApp token={auth.token} renew={auth.renew} onExpired={auth.expire} />
         </CopilotKitProvider>
       ) : (
-        <SafeAreaView
-          style={{
-            flex: 1,
-            backgroundColor: colors.canvas,
-            justifyContent: "center",
-            alignItems: "center",
-            padding: 24,
-          }}
-        >
-          <View style={{ width: "100%", maxWidth: 420, gap: 22, alignItems: "center" }}>
-            <Mascot size={72} />
-            <Text
-              style={{ fontSize: 32, color: colors.text, letterSpacing: -1, fontWeight: "500" }}
-            >
-              Welcome to OpenMuse.
-            </Text>
-            <Text style={[s.muted, { textAlign: "center" }]}>A little room for your day.</Text>
-            {busy ? (
-              <ActivityIndicator color={colors.blueDark} />
-            ) : (
-              <Card style={{ width: "100%" }}>
-                <ErrorNotice error={error} />
-                <Field
-                  label="Workspace access key"
-                  value={accessKey}
-                  onChangeText={setAccessKey}
-                  secureTextEntry
-                  placeholder="Required for a live workspace"
-                />
-                <Button primary onPress={() => void connect(accessKey || undefined)}>
-                  Open workspace
-                </Button>
-                <Text style={[s.small, { marginTop: 15 }]}>
-                  Local workspaces open without a key. Make sure your OpenMuse server is running at{" "}
-                  {API_URL}.
-                </Text>
-              </Card>
-            )}
-          </View>
-        </SafeAreaView>
+        <SignInScreen auth={auth} />
       )}
     </SafeAreaProvider>
   );
 }
-function WorkspaceApp({ token }: { token: string }) {
-  const api = useMemo(() => new MuseApi(token), [token]);
+function WorkspaceApp({
+  token,
+  renew,
+  onExpired,
+}: {
+  token: string;
+  renew: Auth["renew"];
+  onExpired: Auth["expire"];
+}) {
+  const api = useMemo(() => new MuseApi(token, { renew, onExpired }), [token, renew, onExpired]);
   const [workspace, setWorkspace] = useState<Workspace>();
   const [section, setSection] = useState<Section>("chat");
   const [detail, setDetail] = useState<Detail>();
@@ -212,7 +167,7 @@ function WorkspaceApp({ token }: { token: string }) {
       value={{ workspace, api, section, navigate, refresh, open, close, notify: setToast, ask }}
     >
       <AgentWorkspaceProvider>
-        <ComputerDraftProvider key={token}>
+        <ComputerDraftProvider>
           <ThreadsProvider>
             <WorkspaceShell
               detail={detail}
@@ -301,7 +256,7 @@ function WorkspaceShell({
               marginHorizontal: 20,
             }}
           >
-            <View style={{ position: "absolute", left: 0, top: 16 }}>
+            <View style={{ position: "absolute", left: 0, top: 16, zIndex: 1 }}>
               <IconButton
                 icon={Menu}
                 label="Open conversations and menu"
@@ -339,7 +294,7 @@ function WorkspaceShell({
               </Pressable>
               {section === "chat" && <ComputerEntry />}
             </View>
-            <View style={{ position: "absolute", right: 0, top: 16 }}>
+            <View style={{ position: "absolute", right: 0, top: 16, zIndex: 1 }}>
               <IconButton
                 icon={Bell}
                 label={`Notifications, ${pending} unread or pending`}

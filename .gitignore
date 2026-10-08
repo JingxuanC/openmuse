@@ -11,3 +11,6 @@ apps/mobile/android/
 .DS_Store
 *.tsbuildinfo
 artifacts/
+
+# macOS AppleDouble residue (from copying via Finder)
+._*
